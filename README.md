@@ -8,6 +8,10 @@ License
 -------
 Licensed under GNU GPL v3.0.
 
+Demo
+----
+Click [here](https://github.com/mharrys/bloom/raw/master/demo.webm) for a video demonstration.
+
 How-to
 ------
 You will need a C++11 compiler, GLM, GLEW, Assimp and SDL2. Consult SConstruct for
