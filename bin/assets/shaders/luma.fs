@@ -13,7 +13,7 @@ float luminace(vec3 color) {
 void main()
 {
     vec2 uv = gl_FragCoord.xy / resolution.xy;
-    vec4 texel = texture2D(color_map, uv);
+    vec4 texel = texture(color_map, uv);
     if (luminace(texel.rgb) > thresh) {
         // mix some color into the bloom instead of just having a 100% white bloom
         frag_color = vec4(mix(texel, vec4(1.0), 0.8).rgb, 1.0);
