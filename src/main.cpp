@@ -1,30 +1,26 @@
 #include "demo.hpp"
-#include "runner.hpp"
-
-#include <memory>
+#include "highresolutionclock.hpp"
+#include "stdoutlogger.hpp"
+#include "window.hpp"
+#include "windowbuilder.hpp"
+#include "worldrunner.hpp"
 
 int main()
 {
-    WindowSetting window_setting({
-        "Demo",
-        800, 600,
-        // resize
-        true,
-        // fullscreen
-        false,
-        // exit on close
-        true,
-        // exit on esc
-        true
-    });
-    auto window = std::make_shared<Window>(window_setting);
+    auto logger = std::make_shared<gst::StdoutLogger>();
 
-    if (window->is_open()) {
-        Demo demo(window, window_setting);
+    gst::WindowBuilder builder(logger);
+    builder.set_title("Bloom");
+    //builder.set_size({ 1920, 1280 });
+    //builder.set_fullscreen(true);
+    std::shared_ptr<gst::Window> window = builder.build();
 
-        Runner runner;
-        return runner.control(window, demo);
+    if (window) {
+        auto runner = gst::WorldRunner();
+        auto clock = gst::HighResolutionClock();
+        auto demo = Demo(logger, window);
+        return runner.control(demo, clock, *window);
+    } else {
+        return 1;
     }
-
-    return 1;
 }
