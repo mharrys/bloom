@@ -1,9 +1,8 @@
 #version 130
 
-uniform sampler2D tex;
+uniform vec2 resolution;
+uniform sampler2D color_map;
 uniform float thresh = 0.23;
-
-in vec2 tex_coord;
 
 out vec4 frag_color;
 
@@ -13,7 +12,8 @@ float luminace(vec3 color) {
 
 void main()
 {
-    vec4 texel = texture2D(tex, tex_coord);
+    vec2 uv = gl_FragCoord.xy / resolution.xy;
+    vec4 texel = texture2D(color_map, uv);
     if (luminace(texel.rgb) > thresh) {
         // mix some color into the bloom instead of just having a 100% white bloom
         frag_color = vec4(mix(texel, vec4(1.0), 0.8).rgb, 1.0);
