@@ -1,12 +1,12 @@
 #version 130
 
-uniform sampler2D tex;
-
-in vec2 tex_coord;
+uniform vec2 resolution;
+uniform sampler2D color_map;
 
 out vec4 frag_color;
 
 void main()
 {
-    frag_color = texture(tex, tex_coord);
+    vec2 uv = gl_FragCoord.xy / resolution.xy;
+    frag_color = texture(color_map, uv);
 }
