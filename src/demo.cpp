@@ -1,380 +1,264 @@
 #include "demo.hpp"
 
-#include "image.hpp"
-#include "meshloader.hpp"
-
-#include "lib/gl.hpp"
-
-#include <iostream>
-
-Demo::Demo(std::shared_ptr<Window> window, WindowSetting window_setting)
-    : window(window),
-      width(window_setting.width),
-      height(window_setting.height),
-      blur_width(width / 2),
-      blur_height(height / 2),
-      light_position(0.0f, 0.5f, 4.0f, 1.0f),
-      rotation_speed(1.0f)
+Demo::Demo(std::shared_ptr<gst::Logger> logger, std::shared_ptr<gst::Window> window)
+    : logger(logger),
+      window(window),
+      composer(gst::EffectComposer::create(logger)),
+      controls(true, 2.8f, 4.5f),
+      programs(logger),
+      render_size(window->get_size()),
+      bloom_size(render_size.get_width() / 4, render_size.get_height() / 4),
+      weights(5)
 {
 }
 
 bool Demo::create()
 {
-    if (!create_shaders()) {
-        return false;
-    }
+    window->set_pointer_lock(true);
 
-    model = MeshLoader::load("assets/models/suzanne.obj");
-    if (!model) {
-        std::cerr << "Demo::on_create: unable to load model." << std::endl;
-        return false;
-    }
-    model->update_world_transform();
+    create_textures();
+    create_weights();
+    create_luma();
+    create_hblur();
+    create_vblur();
+    create_tonemap();
 
-    create_quad();
+    create_scene();
+    create_skybox();
+    create_model();
 
-    camera.aspect_ratio = width / static_cast<float>(height);
-    camera.translate_z(3.5f);
-    camera.update_world_transform();
-
-    texture_render.bind();
-    texture_render.make(width, height);
-
-    auto make_texture = [](Texture2D & t, int w, int h) -> void
-    {
-        t.mag_filter = FilterMode::NEAREST;
-        t.min_filter = FilterMode::NEAREST;
-        t.wrap_s = WrapMode::CLAMP_TO_EDGE;
-        t.wrap_t = WrapMode::CLAMP_TO_EDGE;
-        t.bind();
-        t.make(w, h);
-    };
-
-    make_texture(texture_luma, width, height);
-    make_texture(texture_vblur, blur_width, blur_height);
-    make_texture(texture_blur, blur_width, blur_height);
-
-    rbo_depth.width = width;
-    rbo_depth.height = height;
-    rbo_depth.make();
-
-    GLenum draw_buffers[] = { GL_COLOR_ATTACHMENT0 };
-
-    fbo_render.bind();
-    fbo_render.attach_color(BindTarget::FRAMEBUFFER, texture_render);
-    fbo_render.attach_depth(BindTarget::FRAMEBUFFER, rbo_depth);
-    glDrawBuffers(1, draw_buffers);
-    Framebuffer::status();
-
-    fbo_luma.bind();
-    fbo_luma.attach_color(BindTarget::FRAMEBUFFER, texture_luma);
-    glDrawBuffers(1, draw_buffers);
-    Framebuffer::status();
-
-    fbo_vblur.bind();
-    fbo_vblur.attach_color(BindTarget::FRAMEBUFFER, texture_vblur);
-    glDrawBuffers(1, draw_buffers);
-    Framebuffer::status();
-
-    fbo_hblur.bind();
-    fbo_hblur.attach_color(BindTarget::FRAMEBUFFER, texture_blur);
-    glDrawBuffers(1, draw_buffers);
-    Framebuffer::status();
-    Framebuffer::unbind();
-
-    create_gaussian_blur_weights();
+    composer.set_color_format(gst::TextureFormat::RGB16F);
 
     return true;
 }
 
-void Demo::update(seconds dt, seconds, Input & input)
+void Demo::update(float delta, float)
 {
-    update_dimension();
+    update_input(delta);
+    scene.update();
 
-    if (blinn_phong_fs.is_modified()) {
-        blinn_phong_fs.recompile();
-        blinn_phong_program.attach(blinn_phong_vs, blinn_phong_fs);
+    composer.set_size(render_size);
+    composer.render(scene);
+    composer.render_to_texture(render_texture);
+    composer.render_filter(luma);
+    composer.render_to_texture(luma_texture);
+
+    composer.set_size(bloom_size);
+    composer.render_filter(hblur, luma_texture);
+    composer.render_filter(vblur);
+    for (int i = 0; i < 2; i++) {
+        composer.render_filter(hblur);
+        composer.render_filter(vblur);
     }
+    composer.render_to_texture(bloom_texture);
 
-    if (luma_fs.is_modified()) {
-        luma_fs.recompile();
-        luma_program.attach(texture_vs, luma_fs);
-    }
-
-    if (input.down(Key::LEFT)) {
-        rotation_speed -= 1.0f;
-    }
-
-    if (input.down(Key::RIGHT)) {
-        rotation_speed += 1.0f;
-    }
-
-    model->rotate_y(rotation_speed * dt.count());
-    model->update_world_transform();
+    composer.set_size(render_size);
+    composer.render_filter(tonemap, render_texture);
+    composer.render_to_screen();
 }
 
-void Demo::render(seconds, seconds)
+void Demo::destroy()
 {
-    // draw scene into texture_render using fbo_render
-    render_pass1();
-    // save luminance above threshold into texture_luma using fbo_luma
-    render_pass2();
-    // apply vertical blur on texture_luma using fbo_blur
-    render_pass3();
-    // apply horizontal blur on texture_luma and draw to main framebuffer
-    render_pass4();
-    // draw render texture from pass 1 to main framebuffer with additive
-    // blending
-    render_pass5();
-
-    gl_print_error();
+    window->set_pointer_lock(false);
 }
 
-bool Demo::create_shaders()
+gst::Filter Demo::create_filter(std::string const fs_path)
 {
-    texture_vs.compile_from_file("assets/shaders/texture.vs");
-    FragmentShader texture_fs;
-    texture_fs.compile_from_file("assets/shaders/texture.fs");
-    if (!texture_program.attach(texture_vs, texture_fs)) {
-        return false;
-    }
+    auto material = gst::Material::create_free();
 
-    blinn_phong_vs.compile_from_file("assets/shaders/blinn_phong.vs");
-    blinn_phong_fs.compile_from_file("assets/shaders/blinn_phong.fs");
-    if (!blinn_phong_program.attach(blinn_phong_vs, blinn_phong_fs)) {
-        return false;
-    }
+    auto program = programs.create(COPY_VS, fs_path);
+    auto pass = std::make_shared<gst::BasicPass>(program);
+    pass->set_cull_face(gst::CullFace::BACK);
 
-    FragmentShader horizontal_blur_fs;
-    horizontal_blur_fs.compile_from_file("assets/shaders/horizontal_blur.fs");
-    if (!horizontal_blur_program.attach(texture_vs, horizontal_blur_fs)) {
-        return false;
-    }
-
-    FragmentShader vertical_blur_fs;
-    vertical_blur_fs.compile_from_file("assets/shaders/vertical_blur.fs");
-    if (!vertical_blur_program.attach(texture_vs, vertical_blur_fs)) {
-        return false;
-    }
-
-    luma_fs.compile_from_file("assets/shaders/luma.fs");
-    if (!luma_program.attach(texture_vs, luma_fs)) {
-        return false;
-    }
-
-    return true;
+    return gst::Filter(material, pass);
 }
 
-void Demo::create_quad()
+void Demo::create_textures()
 {
-    const float w = 1.0f;
-    const float h = 1.0f;
-    quad.positions = {
-        glm::vec3(-w, -h, 0.0f),
-        glm::vec3( w, -h, 0.0f),
-        glm::vec3(-w,  h, 0.0f),
-        glm::vec3( w,  h, 0.0f),
-    };
+    render_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(render_size));
+    render_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    render_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    render_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
 
-    quad.indices = {
-        0, 1, 2,
-        2, 1, 3,
-    };
+    luma_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(render_size));
+    luma_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    luma_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    luma_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
 
-    quad.update_positions = true;
-    quad.update_indices = true;
+    bloom_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(bloom_size));
+    bloom_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    bloom_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    bloom_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
 }
 
-void Demo::create_gaussian_blur_weights()
+void Demo::create_weights()
 {
-    const float sigma = 15.0f;
-    const float sigma_sq = sigma * sigma;
-    // one dimensional guassian function
-    auto gaussian_blur = [sigma_sq](float i) -> float
+    auto variance = 8.0f;
+
+    auto gauss = [variance](float i)
     {
-        return exp(-((i * i) / (2.0f * sigma_sq))) / sqrt(2.0f * PI * sigma_sq);
+        return expf(-((i * i) / (2.0f * variance))) / sqrtf(2.0f * PI * variance);
     };
 
     // the gaussian function is reflective around 0
-    std::vector<float> weight(31);
-    weight[0] = gaussian_blur(0);
-    float sum = weight[0];
-    for (int i = 1; i < 31; i++) {
-        weight[i] = gaussian_blur(i);
-        sum += 2.0f * weight[i];
+    weights[0] = gauss(0);
+    auto sum = weights[0];
+    for (auto i = 1u; i < weights.size(); i++) {
+        weights[i] = gauss(i);
+        sum += 2.0f * weights[i];
     }
 
-    // normalize the weights in order to retain the light, otherwise we could end up
-    // with a darker image for a large sigma
-    for (int i = 0; i < 31; i++) {
-        weight[i] = weight[i] / sum;
-    }
-
-    vertical_blur_program.use();
-    vertical_blur_program.set_uniform("weight", weight);
-
-    horizontal_blur_program.use();
-    horizontal_blur_program.set_uniform("weight", weight);
-}
-
-void Demo::update_dimension()
-{
-    auto dimension = window->dimension();
-    if (width != dimension.first || height != dimension.second) {
-        width = dimension.first;
-        height = dimension.second;
-        blur_width = width / 2;
-        blur_height = height / 2;
-
-        texture_render.bind();
-        texture_render.make(width, height);
-
-        texture_luma.bind();
-        texture_luma.make(width, height);
-
-        texture_vblur.bind();
-        texture_vblur.make(blur_width, blur_height);
-
-        texture_blur.bind();
-        texture_blur.make(blur_width, blur_height);
-
-        rbo_depth.width = width;
-        rbo_depth.height = height;
-        rbo_depth.make();
-
-        camera.aspect_ratio = width / static_cast<float>(height);
+    // normalize or we could end up with a darker image
+    for (auto i = 0u; i < weights.size(); i++) {
+        weights[i] = weights[i] / sum;
     }
 }
 
-void Demo::render_pass1()
+void Demo::create_luma()
 {
-    glViewport(0, 0, width, height);
-
-    fbo_render.bind();
-
-    blinn_phong_program.use();
-
-    glm::mat4 m = model->world_transform();
-    glm::mat4 v = camera.view();
-    glm::mat4 p = camera.projection();
-
-    glm::mat4 mv = v * m;
-    glm::mat4 mvp = p * mv;
-    glm::mat3 nm = glm::inverseTranspose(glm::mat3(mv));
-
-    glm::vec4 light_position_es = v * light_position;
-
-    blinn_phong_program.set_uniform("mv", mv);
-    blinn_phong_program.set_uniform("mvp", mvp);
-    blinn_phong_program.set_uniform("nm", nm);
-    blinn_phong_program.set_uniform("light_position", light_position_es);
-
-    glEnable(GL_DEPTH_TEST);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    model->traverse([&](WorldObject & object) {
-        object.draw();
-    });
-
-    Framebuffer::status();
+    luma = create_filter(LUMA_FS);
 }
 
-void Demo::render_pass2()
+void Demo::create_hblur()
 {
-    luma_program.use();
-
-    glm::mat4 v = ortho_camera.view();
-    glm::mat4 p = ortho_camera.projection();
-    glm::mat4 mvp = p * v;
-
-    luma_program.set_uniform("mvp", mvp);
-
-    fbo_luma.bind();
-
-    texture_render.bind();
-
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    quad.draw();
-
-    glDisable(GL_BLEND);
-
-    Framebuffer::status();
+    hblur = create_filter(HBLUR_FS);
+    hblur.get_uniform("weights").set_float(weights);
 }
 
-void Demo::render_pass3()
+void Demo::create_vblur()
 {
-    glViewport(0, 0, blur_width, blur_height);
-
-    vertical_blur_program.use();
-
-    glm::mat4 v = ortho_camera.view();
-    glm::mat4 p = ortho_camera.projection();
-    glm::mat4 mvp = p * v;
-
-    vertical_blur_program.set_uniform("mvp", mvp);
-    vertical_blur_program.set_uniform("height", static_cast<float>(blur_height));
-
-    fbo_vblur.bind();
-
-    texture_luma.bind();
-
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    quad.draw();
-
-    Framebuffer::status();
+    vblur = create_filter(VBLUR_FS);
+    vblur.get_uniform("weights").set_float(weights);
 }
 
-void Demo::render_pass4()
+void Demo::create_tonemap()
 {
-    horizontal_blur_program.use();
+    tonemap = create_filter(TONEMAP_FS);
 
-    glm::mat4 v = ortho_camera.view();
-    glm::mat4 p = ortho_camera.projection();
-    glm::mat4 mvp = p * v;
-
-    horizontal_blur_program.set_uniform("mvp", mvp);
-    horizontal_blur_program.set_uniform("width", static_cast<float>(blur_width));
-
-    fbo_hblur.bind();
-
-    texture_vblur.bind();
-
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    quad.draw();
-
-    Framebuffer::unbind();
+    auto unit = 1;
+    tonemap.get_textures()[unit] = bloom_texture;
+    tonemap.get_uniform("bloom") = unit;
 }
 
-void Demo::render_pass5()
+void Demo::create_scene()
 {
-    glViewport(0, 0, width, height);
+    auto camera = std::unique_ptr<gst::Camera>(new gst::PerspectiveCamera(45.0f, render_size, 0.1f, 1000.0f));
+    auto eye = std::make_shared<gst::CameraNode>(std::move(camera));
+    eye->position = glm::vec3(0.0f, 1.5f, 8.0f);
+    scene = gst::Scene(eye);
+}
 
-    texture_program.use();
+void Demo::create_skybox()
+{
+    std::string path = UFFIZI_CROSS_HDR;
 
-    glm::mat4 v = ortho_camera.view();
-    glm::mat4 p = ortho_camera.projection();
-    glm::mat4 mvp = p * v;
+    gst::ImageFactory factory(logger);
+    auto image = factory.create_from_file(path);
+    auto image_width = image.get_width();
+    auto pixels = image.get_float_pixels();
 
-    texture_program.set_uniform("mvp", mvp);
+    // Expecting a vertical cross map, top left is (0, 0)
+    //
+    //  -    top      -
+    // left  front    right
+    // -     bottom   -
+    // -     back     -
 
-    glClear(GL_COLOR_BUFFER_BIT);
+    auto face_cols = image_width;
+    auto face_size = face_cols / 3u;
+    auto cube_map_cols = (face_cols * 3u);
+    auto cube_map_row  = cube_map_cols * face_size;
+    std::vector<float> face_pixels(face_size * face_size * 3u);
 
-    texture_render.bind();
-    quad.draw();
+    cube_map = std::make_shared<gst::TextureCube>(gst::TextureCube::create_empty(face_size));
+    cube_map->set_internal_format(gst::TextureFormat::RGB16F);
+    cube_map->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    cube_map->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
+    cube_map->set_wrap_r(gst::WrapMode::CLAMP_TO_EDGE);
 
-    // draw blur texture with additive blending
+    auto copy_face_pixels = [&](unsigned int row, unsigned int col)
+    {
+        auto start = cube_map_row * row + (face_cols * col);
+        auto step = cube_map_cols;
+        auto face_offset = 0u;
+        for (auto i = 0u; i < face_size; i++) {
+            auto index = start + (step * i);
+            for (auto j = 0u; j < face_cols; j++) {
+                face_pixels[face_offset + j] = pixels[index + j];
+            }
+            face_offset += face_cols;
+        }
+    };
 
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    auto update_face_pixels = [&](gst::CubeFace face)
+    {
+        cube_map->update_data(face).set_float(face_pixels);
+    };
 
-    texture_blur.bind();
-    quad.draw();
+    // top
+    copy_face_pixels(0, 1);
+    update_face_pixels(gst::CubeFace::POSITIVE_Y);
+    // left
+    copy_face_pixels(1, 0);
+    update_face_pixels(gst::CubeFace::NEGATIVE_X);
+    // front
+    copy_face_pixels(1, 1);
+    update_face_pixels(gst::CubeFace::POSITIVE_Z);
+    // right
+    copy_face_pixels(1, 2);
+    update_face_pixels(gst::CubeFace::POSITIVE_X);
+    // bottom
+    copy_face_pixels(2, 1);
+    update_face_pixels(gst::CubeFace::NEGATIVE_Y);
+    // back, also rotate 180 degrees counterclockwise while preserving RGB order
+    copy_face_pixels(3, 1);
+    auto size = face_pixels.size();
+    for (auto i = 0u; i < (size / 2); i += 3) {
+        std::swap(face_pixels[i + 2], face_pixels[size - 1 - i]);
+        std::swap(face_pixels[i + 1], face_pixels[size - 2 - i]);
+        std::swap(face_pixels[i + 0], face_pixels[size - 3 - i]);
+    }
+    update_face_pixels(gst::CubeFace::NEGATIVE_Z);
 
-    glDisable(GL_BLEND);
+    auto skybox_program = programs.create(SKYBOX_VS, SKYBOX_FS);
+    auto skybox_pass = std::make_shared<SkyboxPass>(skybox_program);
+    skybox_pass->set_cull_face(gst::CullFace::FRONT);
+    skybox_pass->set_depth_mask(false);
+
+    const auto unit = 1;
+    auto material = gst::Material::create_free();
+    material.get_textures()[unit] = cube_map;
+    material.get_uniform("env") = unit;
+
+    gst::MeshFactory mesh_factory(logger);
+    auto mesh = mesh_factory.create_cube(10.0f);
+    auto model = gst::Model(mesh, material, skybox_pass);
+    auto model_node = std::make_shared<gst::ModelNode>(model);
+    scene.add(model_node);
+}
+
+void Demo::create_model()
+{
+    auto shaded_program = programs.create(REFLECT_VS, REFLECT_FS);
+    auto shaded_pass = std::make_shared<gst::ShadedPass>(shaded_program);
+    shaded_pass->set_cull_face(gst::CullFace::BACK);
+    shaded_pass->set_depth_test(true);
+
+    auto material = gst::Material::create_free();
+
+    const auto unit = 1;
+    material.get_textures()[unit] = cube_map;
+    material.get_uniform("env") = unit;
+
+    gst::MeshFactory mesh_factory(logger);
+    for (auto mesh : mesh_factory.create_from_file(SPHERE_OBJ)) {
+        auto model = gst::Model(mesh, material, shaded_pass);
+        auto model_node = std::make_shared<gst::ModelNode>(model);
+        scene.add(model_node);
+    }
+}
+
+void Demo::update_input(float delta)
+{
+    controls.update(delta, window->get_input(), scene.get_eye());
 }
