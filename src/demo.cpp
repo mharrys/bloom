@@ -3,29 +3,31 @@
 Demo::Demo(std::shared_ptr<gst::Logger> logger, std::shared_ptr<gst::Window> window)
     : logger(logger),
       window(window),
-      controls(true, 2.8f, 1.5f)
+      composer(gst::EffectComposer::create(logger)),
+      controls(true, 2.8f, 4.5f),
+      programs(logger),
+      render_size(window->get_size()),
+      bloom_size(render_size.get_width() / 4, render_size.get_height() / 4),
+      weights(5)
 {
 }
 
 bool Demo::create()
 {
-    auto device = std::make_shared<gst::GraphicsDeviceImpl>();
-    auto synchronizer = std::make_shared<gst::GraphicsSynchronizer>(device, logger);
-    auto render_state = std::make_shared<gst::RenderState>(device, synchronizer);
-    renderer = gst::Renderer(device, render_state, logger);
-
-    gst::MeshFactory mesh_factory(device, logger);
-    gst::ProgramFactory program_factory(device, logger);
-    gst::ProgramPool programs(program_factory);
-
-    create_shaded_pass(programs);
-    create_copy_pass(programs);
-    create_effect_scene(mesh_factory);
-    create_scene();
-    create_suzanne(mesh_factory);
-    create_light();
-
     window->set_pointer_lock(true);
+
+    create_textures();
+    create_weights();
+    create_luma();
+    create_hblur();
+    create_vblur();
+    create_tonemap();
+
+    create_scene();
+    create_skybox();
+    create_model();
+
+    composer.set_color_format(gst::TextureFormat::RGB16F);
 
     return true;
 }
@@ -35,11 +37,24 @@ void Demo::update(float delta, float)
     update_input(delta);
     scene.update();
 
-    renderer.render(scene, effect_target);
-    renderer.check_errors();
+    composer.set_size(render_size);
+    composer.render(scene);
+    composer.render_to_texture(render_texture);
+    composer.render_filter(luma);
+    composer.render_to_texture(luma_texture);
 
-    renderer.render(effect_scene);
-    renderer.check_errors();
+    composer.set_size(bloom_size);
+    composer.render_filter(hblur, luma_texture);
+    composer.render_filter(vblur);
+    for (int i = 0; i < 2; i++) {
+        composer.render_filter(hblur);
+        composer.render_filter(vblur);
+    }
+    composer.render_to_texture(bloom_texture);
+
+    composer.set_size(render_size);
+    composer.render_filter(tonemap, render_texture);
+    composer.render_to_screen();
 }
 
 void Demo::destroy()
@@ -47,112 +62,203 @@ void Demo::destroy()
     window->set_pointer_lock(false);
 }
 
-void Demo::create_shaded_pass(gst::ProgramPool & programs)
+gst::Filter Demo::create_filter(std::string const fs_path)
 {
-    shaded_pass = std::make_shared<gst::ShadedPass>();
-    shaded_pass->cull_face = gst::CullFace::BACK;
-    shaded_pass->depth_test = true;
-    shaded_pass->viewport = window->get_size();
-    shaded_pass->program = programs.create(BLINNPHONG_VS, BLINNPHONG_FS);
+    auto material = gst::Material::create_free();
+
+    auto program = programs.create(COPY_VS, fs_path);
+    auto pass = std::make_shared<gst::BasicPass>(program);
+    pass->set_cull_face(gst::CullFace::BACK);
+
+    return gst::Filter(material, pass);
 }
 
-void Demo::create_copy_pass(gst::ProgramPool & programs)
+void Demo::create_textures()
 {
-    copy_pass = std::make_shared<gst::BasicPass>();
-    copy_pass->cull_face = gst::CullFace::BACK;
-    copy_pass->viewport = window->get_size();
-    copy_pass->program = programs.create(COPY_VS, COPY_FS);
+    render_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(render_size));
+    render_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    render_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    render_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
+
+    luma_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(render_size));
+    luma_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    luma_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    luma_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
+
+    bloom_texture = std::make_shared<gst::Texture2D>(gst::Texture2D::create_empty(bloom_size));
+    bloom_texture->set_internal_format(gst::TextureFormat::RGB16F);
+    bloom_texture->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    bloom_texture->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
 }
 
-void Demo::create_effect_scene(gst::MeshFactory & mesh_factory)
+void Demo::create_weights()
 {
-    const auto size = window->get_size();
+    auto variance = 8.0f;
 
-    std::vector<unsigned char> copy_data = {};
-    auto color = std::make_shared<gst::Texture2D>(size, copy_data);
-    color->set_min_filter(gst::FilterMode::NEAREST);
-    color->set_mag_filter(gst::FilterMode::NEAREST);
-    color->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
-    color->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
+    auto gauss = [variance](float i)
+    {
+        return expf(-((i * i) / (2.0f * variance))) / sqrtf(2.0f * PI * variance);
+    };
 
-    auto depth = std::make_shared<gst::RenderbufferImpl>(size, gst::RenderbufferFormat::DEPTH_COMPONENT32);
+    // the gaussian function is reflective around 0
+    weights[0] = gauss(0);
+    auto sum = weights[0];
+    for (auto i = 1u; i < weights.size(); i++) {
+        weights[i] = gauss(i);
+        sum += 2.0f * weights[i];
+    }
 
-    effect_target = std::make_shared<gst::FramebufferImpl>();
-    effect_target->set_color({ color });
-    effect_target->set_depth({ depth });
+    // normalize or we could end up with a darker image
+    for (auto i = 0u; i < weights.size(); i++) {
+        weights[i] = weights[i] / sum;
+    }
+}
 
-    auto formatter = std::make_shared<gst::AnnotationBasic>();
-    auto uniforms = std::make_shared<gst::UniformMapImpl>(formatter);
-    uniforms->get_uniform("resolution") = glm::vec2(size.get_width(), size.get_height());
+void Demo::create_luma()
+{
+    luma = create_filter(LUMA_FS);
+}
 
-    auto effect = gst::Effect(copy_pass, uniforms);
-    effect.get_textures().push_back(color);
+void Demo::create_hblur()
+{
+    hblur = create_filter(HBLUR_FS);
+    hblur.get_uniform("weights").set_float(weights);
+}
 
-    auto quad = mesh_factory.create_quad(1.0f, 1.0f);
-    auto model = std::make_shared<gst::Model>(quad, effect);
-    auto model_node = std::make_shared<gst::ModelNode>(model);
+void Demo::create_vblur()
+{
+    vblur = create_filter(VBLUR_FS);
+    vblur.get_uniform("weights").set_float(weights);
+}
 
-    auto camera = std::make_shared<gst::OrthoCamera>();
-    auto eye = std::make_shared<gst::CameraNode>(camera);
+void Demo::create_tonemap()
+{
+    tonemap = create_filter(TONEMAP_FS);
 
-    effect_scene = gst::Scene(eye);
-    effect_scene.add(model_node);
-    effect_scene.update();
+    auto unit = 1;
+    tonemap.get_textures()[unit] = bloom_texture;
+    tonemap.get_uniform("bloom") = unit;
 }
 
 void Demo::create_scene()
 {
-    const auto size = window->get_size();
-
-    auto camera = std::make_shared<gst::PerspectiveCamera>(45.0f, size, 0.1f, 1000.0f);
-    auto eye = std::make_shared<gst::CameraNode>(camera);
-    eye->translate_z(3.5f);
-
+    auto camera = std::unique_ptr<gst::Camera>(new gst::PerspectiveCamera(45.0f, render_size, 0.1f, 1000.0f));
+    auto eye = std::make_shared<gst::CameraNode>(std::move(camera));
+    eye->position = glm::vec3(0.0f, 1.5f, 8.0f);
     scene = gst::Scene(eye);
 }
 
-void Demo::create_suzanne(gst::MeshFactory & mesh_factory)
+void Demo::create_skybox()
 {
-    auto uniforms = std::make_shared<gst::UniformMapImpl>(
-        std::make_shared<gst::AnnotationStruct>("material")
-    );
-    uniforms->get_uniform("ambient") = glm::vec3(0.2f);
-    uniforms->get_uniform("diffuse") = glm::vec3(0.0f, 1.0f, 1.0f);
-    uniforms->get_uniform("specular") = glm::vec3(1.0f);
-    uniforms->get_uniform("emission") = glm::vec3(0.0f);
-    uniforms->get_uniform("shininess") = 15.0f;
+    std::string path = UFFIZI_CROSS_HDR;
 
-    auto effect = gst::Effect(shaded_pass, uniforms);
+    gst::ImageFactory factory(logger);
+    auto image = factory.create_from_file(path);
+    auto image_width = image.get_width();
+    auto pixels = image.get_float_pixels();
 
-    for (auto mesh : mesh_factory.create_from_file(SUZANNE_OBJ)) {
-        auto model = std::make_shared<gst::Model>(mesh, effect);
+    // Expecting a vertical cross map, top left is (0, 0)
+    //
+    //  -    top      -
+    // left  front    right
+    // -     bottom   -
+    // -     back     -
+
+    auto face_cols = image_width;
+    auto face_size = face_cols / 3u;
+    auto cube_map_cols = (face_cols * 3u);
+    auto cube_map_row  = cube_map_cols * face_size;
+    std::vector<float> face_pixels(face_size * face_size * 3u);
+
+    cube_map = std::make_shared<gst::TextureCube>(gst::TextureCube::create_empty(face_size));
+    cube_map->set_internal_format(gst::TextureFormat::RGB16F);
+    cube_map->set_wrap_s(gst::WrapMode::CLAMP_TO_EDGE);
+    cube_map->set_wrap_t(gst::WrapMode::CLAMP_TO_EDGE);
+    cube_map->set_wrap_r(gst::WrapMode::CLAMP_TO_EDGE);
+
+    auto copy_face_pixels = [&](unsigned int row, unsigned int col)
+    {
+        auto start = cube_map_row * row + (face_cols * col);
+        auto step = cube_map_cols;
+        auto face_offset = 0u;
+        for (auto i = 0u; i < face_size; i++) {
+            auto index = start + (step * i);
+            for (auto j = 0u; j < face_cols; j++) {
+                face_pixels[face_offset + j] = pixels[index + j];
+            }
+            face_offset += face_cols;
+        }
+    };
+
+    auto update_face_pixels = [&](gst::CubeFace face)
+    {
+        cube_map->update_data(face).set_float(face_pixels);
+    };
+
+    // top
+    copy_face_pixels(0, 1);
+    update_face_pixels(gst::CubeFace::POSITIVE_Y);
+    // left
+    copy_face_pixels(1, 0);
+    update_face_pixels(gst::CubeFace::NEGATIVE_X);
+    // front
+    copy_face_pixels(1, 1);
+    update_face_pixels(gst::CubeFace::POSITIVE_Z);
+    // right
+    copy_face_pixels(1, 2);
+    update_face_pixels(gst::CubeFace::POSITIVE_X);
+    // bottom
+    copy_face_pixels(2, 1);
+    update_face_pixels(gst::CubeFace::NEGATIVE_Y);
+    // back, also rotate 180 degrees counterclockwise while preserving RGB order
+    copy_face_pixels(3, 1);
+    auto size = face_pixels.size();
+    for (auto i = 0u; i < (size / 2); i += 3) {
+        std::swap(face_pixels[i + 2], face_pixels[size - 1 - i]);
+        std::swap(face_pixels[i + 1], face_pixels[size - 2 - i]);
+        std::swap(face_pixels[i + 0], face_pixels[size - 3 - i]);
+    }
+    update_face_pixels(gst::CubeFace::NEGATIVE_Z);
+
+    auto skybox_program = programs.create(SKYBOX_VS, SKYBOX_FS);
+    auto skybox_pass = std::make_shared<SkyboxPass>(skybox_program);
+    skybox_pass->set_cull_face(gst::CullFace::FRONT);
+    skybox_pass->set_depth_mask(false);
+
+    const auto unit = 1;
+    auto material = gst::Material::create_free();
+    material.get_textures()[unit] = cube_map;
+    material.get_uniform("env") = unit;
+
+    gst::MeshFactory mesh_factory(logger);
+    auto mesh = mesh_factory.create_cube(10.0f);
+    auto model = gst::Model(mesh, material, skybox_pass);
+    auto model_node = std::make_shared<gst::ModelNode>(model);
+    scene.add(model_node);
+}
+
+void Demo::create_model()
+{
+    auto shaded_program = programs.create(REFLECT_VS, REFLECT_FS);
+    auto shaded_pass = std::make_shared<gst::ShadedPass>(shaded_program);
+    shaded_pass->set_cull_face(gst::CullFace::BACK);
+    shaded_pass->set_depth_test(true);
+
+    auto material = gst::Material::create_free();
+
+    const auto unit = 1;
+    material.get_textures()[unit] = cube_map;
+    material.get_uniform("env") = unit;
+
+    gst::MeshFactory mesh_factory(logger);
+    for (auto mesh : mesh_factory.create_from_file(SPHERE_OBJ)) {
+        auto model = gst::Model(mesh, material, shaded_pass);
         auto model_node = std::make_shared<gst::ModelNode>(model);
         scene.add(model_node);
     }
 }
 
-void Demo::create_light()
-{
-    auto uniforms = std::make_shared<gst::UniformMapImpl>(
-        std::make_shared<gst::AnnotationArray>("point_lights")
-    );
-    uniforms->get_uniform("ambient") = glm::vec3(0.2f);
-    uniforms->get_uniform("diffuse") = glm::vec3(1.0f);
-    uniforms->get_uniform("specular") = glm::vec3(1.0f);
-    uniforms->get_uniform("attenuation.constant") = 1.0f;
-    uniforms->get_uniform("attenuation.linear") = 0.5f;
-    uniforms->get_uniform("attenuation.quadratic") = 0.03f;
-
-    auto light = std::make_shared<gst::Light>(uniforms);
-    auto light_node = std::make_shared<gst::LightNode>(light);
-    light_node->position = glm::vec3(0.0f, 0.5f, 4.0f);
-
-    scene.add(light_node);
-}
-
 void Demo::update_input(float delta)
 {
-    const auto input = window->get_input();
-
-    controls.update(delta, input, *scene.get_eye());
+    controls.update(delta, window->get_input(), scene.get_eye());
 }

@@ -2,6 +2,7 @@
 #define DEMO_HPP_INCLUDED
 
 #include "assets.hpp"
+#include "skyboxpass.hpp"
 
 #include "gust.hpp"
 
@@ -12,26 +13,41 @@ public:
     void update(float delta, float elapsed) final;
     void destroy() final;
 private:
-    void create_shaded_pass(gst::ProgramPool & programs);
-    void create_copy_pass(gst::ProgramPool & programs);
-    void create_effect_scene(gst::MeshFactory & mesh_factory);
+    gst::Filter create_filter(std::string const fs_path);
+    void create_textures();
+    void create_weights();
+    void create_luma();
+    void create_hblur();
+    void create_vblur();
+    void create_tonemap();
     void create_scene();
-    void create_suzanne(gst::MeshFactory & mesh_factory);
-    void create_light();
+    void create_skybox();
+    void create_model();
     void update_input(float delta);
 
     std::shared_ptr<gst::Logger> logger;
     std::shared_ptr<gst::Window> window;
 
-    gst::Renderer renderer;
-    gst::Scene scene;
+    gst::EffectComposer composer;
     gst::FirstPersonControl controls;
+    gst::Scene scene;
 
-    std::shared_ptr<gst::ShadedPass> shaded_pass;
-    std::shared_ptr<gst::BasicPass> copy_pass;
+    gst::ProgramPool programs;
 
-    gst::Scene effect_scene;
-    std::shared_ptr<gst::Framebuffer> effect_target;
+    gst::Resolution render_size;
+    gst::Resolution bloom_size;
+
+    std::shared_ptr<gst::Texture2D> render_texture;
+    std::shared_ptr<gst::Texture2D> luma_texture;
+    std::shared_ptr<gst::Texture2D> bloom_texture;
+    std::shared_ptr<gst::TextureCube> cube_map;
+
+    std::vector<float> weights;
+
+    gst::Filter luma;
+    gst::Filter hblur;
+    gst::Filter vblur;
+    gst::Filter tonemap;
 };
 
 #endif
