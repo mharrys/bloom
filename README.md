@@ -1,6 +1,6 @@
 Bloom
 =====
-High-dynamic-range rendering (HDR) with bloom as a post-processing effect. HDR
+High-dynamic-range (HDR) rendering with bloom as a post-processing effect. HDR
 image from [Probes](http://www.pauldebevec.com/Probes/).
 
 Screenshot
