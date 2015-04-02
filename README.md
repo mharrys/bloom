@@ -1,21 +1,20 @@
 Bloom
 =====
-Simple post-procesing effect using OpenGL and GLSL.
+High-dynamic-range rendering (HDR) with bloom as a post-processing effect. HDR
+image from [Probes](http://www.pauldebevec.com/Probes/).
 
-+ Press `Left arrow` or `Right arrow` to control the rotation speed.
-
-License
--------
-Licensed under GNU GPL v3.0.
-
-Demo
-----
-Click [here](https://github.com/mharrys/bloom/raw/master/demo.webm) for a video demonstration.
+Screenshot
+----------
+![scrot](https://github.com/mharrys/bloom/raw/master/scrot.png)
 
 How-to
 ------
-You will need a C++11 compiler, GLM, GLEW, Assimp and SDL2. Consult SConstruct for
-details.
+This project depends on [Gust](https://github.com/mharrys/gust), see its
+project page for details on dependencies.
+
+Recursive clone required
+
+    $ git clone --recursive <repository>
 
 Build and run
 
@@ -30,4 +29,5 @@ Cleanup
 References
 ----------
 1. David Wolff. OpenGL 4.0 Shading Language Cookbook. Packt Publishing. 2011.
-2. Efficient Gaussian blur with linear sampling. [downloaded 2014-09-15]. Available from http://rastergrid.com/blog/2010/09/efficient-gaussian-blur-with-linear-sampling/comment-page-1/.
+2. Cube Maps: Sky Boxes and Environment Mapping. [downloaded 2015-04-01]. Available from http://antongerdelan.net/opengl/cubemaps.html.
+3. High Dynamic Range Rendering in OpenGL. Fabien Houlmann; Stéphane Metz.
