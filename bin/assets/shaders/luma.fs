@@ -7,7 +7,8 @@ uniform float thresh = 0.5;
 
 out vec4 frag_color;
 
-void main(void) {
+void main()
+{
     vec2 uv = gl_FragCoord.xy / resolution.xy;
     vec4 texel = texture(read, uv);
 
