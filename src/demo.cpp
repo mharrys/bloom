@@ -142,10 +142,8 @@ void Demo::create_tonemap()
 
 void Demo::create_scene()
 {
-    auto camera = std::unique_ptr<gst::Camera>(new gst::PerspectiveCamera(45.0f, render_size, 0.1f, 1000.0f));
-    auto eye = std::make_shared<gst::CameraNode>(std::move(camera));
-    eye->position = glm::vec3(0.0f, 1.5f, 8.0f);
-    scene = gst::Scene(eye);
+    scene = gst::Scene::create_perspective({ 45.0f, render_size, 0.1f, 1000.0f });
+    scene.get_eye().position = glm::vec3(0.0f, 1.5f, 8.0f);
 }
 
 void Demo::create_skybox()
@@ -153,7 +151,7 @@ void Demo::create_skybox()
     std::string path = UFFIZI_CROSS_HDR;
 
     gst::ImageFactory factory(logger);
-    auto image = factory.create_from_file(path);
+    auto image = factory.create_from_file(path, false);
     auto image_width = image.get_width();
     auto pixels = image.get_float_pixels();
 
