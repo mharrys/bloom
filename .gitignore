@@ -4,6 +4,8 @@
 *.o
 *.obj
 !suzanne.obj
+!teapot.obj
+!sphere.obj
 
 # Compiled Dynamic libraries
 *.so
